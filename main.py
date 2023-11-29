@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import re
+from time import time
 from typing import List, Optional, Union
 import numpy as np
 import torch
@@ -22,7 +23,7 @@ TERMINAL_TOKEN = "<|endoftext|>"
 SEED = 1
 UCB_BASE = 10
 UCB_CONSTANT = 4
-NUM_ROLLOUTS = 1
+NUM_ROLLOUTS = 3
 NUM_BEAMS = 1
 
 
@@ -64,24 +65,30 @@ class ModelContext:
     max_gen_horizon: int
     num_beams: int = NUM_BEAMS
 
+    def __post_init__(self):
+        self.cache = {}
+
     def generate(self, ids: List[int], next_token_only: bool = False):
-        input_ids = torch.LongTensor(ids).unsqueeze(0).to(device)
-        kwargs = (
-            {"max_new_tokens": 1}
-            if next_token_only
-            else {"max_length": self.max_gen_horizon}
-        )
-        return self.model.generate(
-            input_ids,
-            top_k=self.k,
-            num_beams=self.num_beams,
-            early_stopping=self.num_beams > 1,
-            return_dict_in_generate=True,
-            output_scores=True,
-            use_cache=True,
-            do_sample=self.k > 1,
-            **kwargs,
-        )  # type: ignore
+        key = (tuple(ids), next_token_only)
+        if key not in self.cache:
+            input_ids = torch.LongTensor(ids).unsqueeze(0).to(device)
+            kwargs = (
+                {"max_new_tokens": 1}
+                if next_token_only
+                else {"max_length": self.max_gen_horizon}
+            )
+            self.cache[key] = self.model.generate(
+                input_ids,
+                top_k=self.k,
+                num_beams=self.num_beams,
+                early_stopping=self.num_beams > 1,
+                return_dict_in_generate=True,
+                output_scores=True,
+                use_cache=True,
+                do_sample=self.k > 1,
+                **kwargs,
+            )  # type: ignore
+        return self.cache[key]
 
 
 class Node:
@@ -103,6 +110,10 @@ class Node:
         self.visits = 1
         self.observed_rewards = []
         self._children = []
+
+    @property
+    def display_action(self):
+        return "root" if self.action is None else self.action
 
     @property
     def is_leaf_node(self) -> bool:
@@ -189,8 +200,17 @@ def compute_reward(code: str, problem: Problem) -> int:
     )
 
 
+def log_progress(
+    num_actions: int, root: Node, node: Node, level: int, rollout_index: int
+):
+    print(
+        f"Action #: {num_actions:<2} | State 'Tip': {root.state[-1]:<5} | Selection | Rollout #: {rollout_index} | Action: {node.display_action:<5} | Level: {level:<2}"  # noqa: E501
+    )
+
+
 if __name__ == "__main__":
-    # Setup model
+    # Setup
+    print("Loading model, tokenizer, etc...")
     device = (
         torch.device("cuda")
         if torch.cuda.is_available() and not NO_CUDA
@@ -202,6 +222,10 @@ if __name__ == "__main__":
     )
     model.to(device)
     (terminal_token_id,) = tokenizer.encode(TERMINAL_TOKEN)
+    model_context = ModelContext(
+        model, tokenizer, max_gen_horizon=MAX_GEN_HORIZON, k=K
+    )  # noqa: E501
+    policy = Policy()
 
     # Set seeds
     np.random.seed(SEED)
@@ -209,12 +233,11 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(SEED)
 
     # Load problem
-    problem = Problem(TEST_PROBLEMS_DIR, TEST_PROBLEM_INDEX)
-    state = tokenizer.encode(problem.prompt)
 
     # Run MCTS
-    model_context = ModelContext(model, tokenizer, max_gen_horizon=MAX_GEN_HORIZON, k=K)
-    policy = Policy()
+    print("Running MCTS...")
+    problem = Problem(TEST_PROBLEMS_DIR, TEST_PROBLEM_INDEX)
+    state = tokenizer.encode(problem.prompt)
     node = root = Node(
         state=state,
         action=None,
@@ -223,16 +246,25 @@ if __name__ == "__main__":
         model_context=model_context,
         terminal_token_id=terminal_token_id,
     )
-    while not node.state[-1] == terminal_token_id:
+    plan = True
+    num_actions = 0
+    while plan:
+        start = time()
         # Perform rollouts
-        for _ in range(NUM_ROLLOUTS):
+        for i in range(1, NUM_ROLLOUTS + 1):
             # Start at root
             node = root
+            level = 0
             # Selection (select a leaf node)
             while True:
                 if node.is_leaf_node:
+                    log_progress(num_actions, root, node, level, i)
                     break
                 node = max(node.children, key=policy)
+                level += 1
+            if node.state[-1] == terminal_token_id:
+                plan = False
+                break
             # Expansion (expand children, select one to rollout)
             # NB: If scores are the same, first node will always be selected.
             node = max(node.children, key=policy)
@@ -241,6 +273,14 @@ if __name__ == "__main__":
             text = model_context.tokenizer.decode(ids)
             code = extract_code(text)
             reward = compute_reward(code, problem)
-            import pdb
-
-            pdb.set_trace()
+            # Backpropagation (update node statistics)
+            while node:
+                node.visits += 1
+                node.observed_rewards.append(reward)
+                node = node.parent
+        # Take action, reset root
+        node = root = max(root.children, key=lambda node: node.value)
+        print(
+            f"Action #: {num_actions:<2} | Action: {node.display_action:<7} | Elapsed: {time() - start:.2f}s"  # noqa: E501
+        )
+        num_actions += 1
