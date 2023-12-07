@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass
 import re
 from time import time
@@ -16,7 +17,7 @@ MODEL_NAME = "gpt2"
 MODEL_PATH = "models/1.5B"
 TEST_PROBLEMS_DIR = "APPS/test"
 MAX_GEN_HORIZON = 1024
-K = 3
+K = 1
 TEST_PROBLEM_INDEX = 4136
 NO_CUDA = False
 TERMINAL_TOKEN = "<|endoftext|>"
@@ -56,39 +57,95 @@ class Problem:
 
 
 @dataclass
+class OutputTrieNode:
+    id: int
+    score_tensor: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        self.children = {}
+
+
+class OutputTrie:
+    def __init__(self, terminal_token_id: int):
+        self.terminal_token_id = terminal_token_id
+        self.root = OutputTrieNode(id=-1)
+
+    def insert(self, sequence: List[int], scores: List[torch.Tensor]):
+        input_seq_len = len(sequence) - len(scores)
+        scores = [None] * input_seq_len + scores  # type: ignore
+        node = self.root
+        for id, tensor in zip(sequence, scores):
+            if id not in node.children:
+                node.children[id] = OutputTrieNode(id, tensor)
+            node = node.children[id]
+
+    def search(self, sequence: List[int], next_token_only: bool = False):
+        node = self.root
+        output = defaultdict(list)
+        # Navigate to input sequence tip
+        for id in sequence:
+            if id not in node.children:
+                return
+            node = node.children[id]
+            output["sequence"].append(id)
+        # Walk remaining output sequence
+        while len(node.children) == 1:
+            (id,) = list(node.children)
+            node = node.children[id]
+            output["sequence"].append(id)
+            output["scores"].append(node.score_tensor)
+            if next_token_only:
+                return output
+        if node.id == self.terminal_token_id:
+            return output
+
+
+@dataclass
 class ModelContext:
     model: torch.nn.Module
     tokenizer: Union[
         transformers.PreTrainedTokenizer, transformers.PreTrainedTokenizerFast
     ]
     k: int
+    terminal_token_id: int
     max_gen_horizon: int
     num_beams: int = NUM_BEAMS
 
     def __post_init__(self):
-        self.cache = {}
+        self.cache = OutputTrie(self.terminal_token_id)
+
+    def _generate(self, ids: List[int], next_token_only: bool = False):
+        input_ids = torch.LongTensor(ids).unsqueeze(0).to(device)
+        kwargs = (
+            {"max_new_tokens": 1}
+            if next_token_only
+            else {"max_length": self.max_gen_horizon}
+        )
+        output = self.model.generate(
+            input_ids,
+            num_beams=self.num_beams,
+            early_stopping=self.num_beams > 1,
+            return_dict_in_generate=True,
+            output_scores=True,
+            use_cache=True,
+            do_sample=self.k > 1,
+            **kwargs,
+        )  # type: ignore
+        (sequence,) = output.sequences
+        sequence = sequence.squeeze(0).tolist()
+        scores = [scores.squeeze(0) for scores in output.scores]
+        return {"sequence": sequence, "scores": scores}
 
     def generate(self, ids: List[int], next_token_only: bool = False):
-        key = (tuple(ids), next_token_only)
-        if key not in self.cache:
-            input_ids = torch.LongTensor(ids).unsqueeze(0).to(device)
-            kwargs = (
-                {"max_new_tokens": 1}
-                if next_token_only
-                else {"max_length": self.max_gen_horizon}
-            )
-            self.cache[key] = self.model.generate(
-                input_ids,
-                top_k=self.k,
-                num_beams=self.num_beams,
-                early_stopping=self.num_beams > 1,
-                return_dict_in_generate=True,
-                output_scores=True,
-                use_cache=True,
-                do_sample=self.k > 1,
-                **kwargs,
-            )  # type: ignore
-        return self.cache[key]
+        output = self.cache.search(ids, next_token_only)
+        if output:
+            return output
+        output = self._generate(ids, next_token_only)
+        self.cache.insert(
+            output["sequence"],
+            output["scores"],
+        )
+        return output
 
 
 class Node:
@@ -99,14 +156,12 @@ class Node:
         prob: Optional[float],
         parent: Optional["Node"],
         model_context: ModelContext,
-        terminal_token_id: int,
     ) -> None:
         self.state = state
         self.action = action
         self.prob = prob
         self.parent = parent
         self.ctx = model_context
-        self.terminal_token_id = terminal_token_id
         self.visits = 1
         self.observed_rewards = []
         self._children = []
@@ -124,7 +179,7 @@ class Node:
 
     @property
     def is_terminal(self):
-        return self.state[-1] == self.terminal_token_id
+        return self.state[-1] == self.ctx.terminal_token_id
 
     @property
     def children(self):
@@ -140,8 +195,7 @@ class Node:
 
     def _generate_children(self):
         output = self.ctx.generate(self.state, next_token_only=True)
-        (scores,) = output.scores
-        scores = scores.squeeze(0)
+        (scores,) = output["scores"]
         top_k_scores, top_k_ids = torch.topk(scores, K)
         top_k_scores = torch.softmax(top_k_scores, dim=-1)
         children = []
@@ -156,7 +210,6 @@ class Node:
                     prob=prob,
                     parent=self,
                     model_context=self.ctx,
-                    terminal_token_id=self.terminal_token_id,
                 )
             )
         return children
@@ -200,11 +253,22 @@ def compute_reward(code: str, problem: Problem) -> int:
     )
 
 
-def log_progress(
-    num_actions: int, root: Node, node: Node, level: int, rollout_index: int
+def log_info(
+    num_actions: int,
+    root: Optional[Node],
+    node: Node,
+    rollout_index: Optional[int],
+    token: Optional[str],
+    elapsed: Optional[float],
 ):
     print(
-        f"Action #: {num_actions:<2} | State 'Tip': {root.state[-1]:<5} | Selection | Rollout #: {rollout_index} | Action: {node.display_action:<5} | Level: {level:<2}"  # noqa: E501
+        f"Step: {('Prediction' if elapsed is not None else 'Selection'):<10} |",  # noqa: E501
+        f"Action #: {num_actions:<2} |",
+        f"State 'Tip': {root.state[-1] if root else 'N/A':<6} |",
+        f"Rollout #: {rollout_index if rollout_index is not None else 'N/A':<4} |",  # noqa: E501
+        f"Action: {node.display_action if node else 'N/A':<6} |",
+        f"Token: {repr(token) if token is not None else 'N/A':<5} |",
+        f"Elapsed: {(str(np.round(elapsed, 3)) + 's' if elapsed is not None else 'N/A'):<7} |",  # noqa: E501
     )
 
 
@@ -223,7 +287,11 @@ if __name__ == "__main__":
     model.to(device)
     (terminal_token_id,) = tokenizer.encode(TERMINAL_TOKEN)
     model_context = ModelContext(
-        model, tokenizer, max_gen_horizon=MAX_GEN_HORIZON, k=K
+        model,
+        tokenizer,
+        k=K,
+        terminal_token_id=terminal_token_id,
+        max_gen_horizon=MAX_GEN_HORIZON,
     )  # noqa: E501
     policy = Policy()
 
@@ -244,43 +312,55 @@ if __name__ == "__main__":
         prob=None,
         parent=None,
         model_context=model_context,
-        terminal_token_id=terminal_token_id,
     )
-    plan = True
     num_actions = 0
-    while plan:
+    rewards_cache = {}
+    result = list(state)
+    while True:
         start = time()
         # Perform rollouts
         for i in range(1, NUM_ROLLOUTS + 1):
             # Start at root
             node = root
-            level = 0
             # Selection (select a leaf node)
             while True:
                 if node.is_leaf_node:
-                    log_progress(num_actions, root, node, level, i)
+                    log_info(num_actions, root, node, i, None, None)
                     break
                 node = max(node.children, key=policy)
-                level += 1
-            if node.state[-1] == terminal_token_id:
-                plan = False
-                break
-            # Expansion (expand children, select one to rollout)
-            # NB: If scores are the same, first node will always be selected.
-            node = max(node.children, key=policy)
-            # Simulate (simulate rollout)
-            (ids,) = model_context.generate(node.state).sequences.tolist()
-            text = model_context.tokenizer.decode(ids)
-            code = extract_code(text)
-            reward = compute_reward(code, problem)
-            # Backpropagation (update node statistics)
-            while node:
-                node.visits += 1
-                node.observed_rewards.append(reward)
-                node = node.parent
+            if not node.state[-1] == terminal_token_id:
+                # Expansion (expand children, select one to rollout)
+                # NB: If scores are the same, first node will always be selected.  # noqa: E501
+                node = max(node.children, key=policy)
+                # Simulate (simulate rollout)
+                output = model_context.generate(node.state)
+                text = model_context.tokenizer.decode(output["sequence"])
+                code = extract_code(text)
+                # Compute reward
+                key = (code, problem)
+                if key not in rewards_cache:
+                    rewards_cache[key] = compute_reward(code, problem)
+                reward = rewards_cache[key]
+                # Backpropagation (update node statistics)
+                while node:
+                    node.visits += 1
+                    node.observed_rewards.append(reward)
+                    node = node.parent
         # Take action, reset root
         node = root = max(root.children, key=lambda node: node.value)
-        print(
-            f"Action #: {num_actions:<2} | Action: {node.display_action:<7} | Elapsed: {time() - start:.2f}s"  # noqa: E501
+        # Log action
+        elapsed = time() - start
+        log_info(
+            num_actions,
+            None,
+            node,
+            None,
+            tokenizer.decode(node.action),
+            elapsed,
         )
+        result.append(node.action)
         num_actions += 1
+        # Check if we're done
+        if node.state[-1] == terminal_token_id:
+            break
+    print(f"\n>>> Result:\n\n{extract_code(tokenizer.decode(result))}")
