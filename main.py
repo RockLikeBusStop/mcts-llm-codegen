@@ -1,17 +1,16 @@
 import argparse
+import os
+import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
-import re
 from time import time
 from typing import List, Optional
+
 import modal
 import numpy as np
-
 import torch
-
 import transformers
-
-import sys
 
 sys.path.append("Code-AI-Tree-Search/eval")
 from compute_reward import compute_reward as _compute_reward  # type: ignore
@@ -119,17 +118,30 @@ class OutputTrie:
 
 
 @stub.cls(gpu="any")
-@dataclass
 class ModelContext:
-    model_path: str
-    model_name: str
-    k: int
-    terminal_token: str
-    max_gen_horizon: int
-    no_cuda: bool = NO_CUDA
-    num_beams: int = NUM_BEAMS
-
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        k: int,
+        remote: bool,
+        model_path: str = MODEL_PATH,
+        model_name: str = MODEL_NAME,
+        terminal_token: str = TERMINAL_TOKEN,
+        max_gen_horizon: int = MAX_GEN_HORIZON,
+        no_cuda: bool = NO_CUDA,
+        num_beams: int = NUM_BEAMS,
+    ):
+        self.k = k
+        self.remote = remote
+        self.model_path = model_path
+        self.model_name = model_name
+        self.terminal_token = terminal_token
+        self.max_gen_horizon = max_gen_horizon
+        self.no_cuda = no_cuda
+        self.num_beams = num_beams
+        # Set seed
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
         self.generations = 0
         # Setup device
         self.device = (
@@ -138,14 +150,15 @@ class ModelContext:
             else torch.device("cpu")
         )
         # Load tokenizer
+        print(f"Loading tokenizer, cwd is: {os.getcwd()}")
         tokenizer = transformers.AutoTokenizer.from_pretrained(self.model_name)
         (self.terminal_token_id,) = tokenizer.encode(self.terminal_token)
         # Load model
-        print("Loading model...")
+        print(f"Loading model, cwd is: {os.getcwd()}")
         self.model = transformers.AutoModelForCausalLM.from_pretrained(
             self.model_path, pad_token_id=tokenizer.eos_token_id
         )
-        print("Model loaded; moving to device...")
+        print(f"Model loaded; moving to device {self.device}; cwd is: {os.getcwd()}")
         self.model.to(self.device)
         # Setup cache
         self.cache = OutputTrie(self.terminal_token_id)
@@ -154,6 +167,7 @@ class ModelContext:
 
     @modal.method()
     def _generate(self, ids: List[int], next_token_only: bool = False):
+        start = time()
         input_ids = torch.LongTensor(ids).unsqueeze(0).to(self.device)
         kwargs = (
             {"max_new_tokens": 1}
@@ -170,22 +184,24 @@ class ModelContext:
             do_sample=False,
             **kwargs,
         )  # type: ignore
+        self.generations += 1
+        print(
+            f"Generate was called with remote = {self.remote} | Generation {self.generations} took {time() - start:.3f}s on {self.device}"
+        )  # noqa: E501
         (sequence,) = output.sequences
         sequence = sequence.squeeze(0).tolist()
         scores = [scores.squeeze(0).cpu() for scores in output.scores]
-        self.generations += 1
         return {"sequence": sequence, "scores": scores}
 
     def generate(
         self,
         ids: List[int],
         next_token_only: bool = False,
-        remote: bool = False,  # noqa: E501
     ):
         output = self.cache.search(ids, next_token_only)
         if output:
             return output
-        func = self._generate.remote if remote else self._generate.local
+        func = self._generate.remote if self.remote else self._generate.local
         output = func(ids, next_token_only)
         self.cache.insert(
             output["sequence"],
@@ -301,7 +317,6 @@ def compute_reward(code: str, problem: Problem) -> int:
 
 def log_info(
     num_actions: int,
-    root: Optional[Node],
     node: Node,
     rollout_index: Optional[int],
     token: Optional[str],
@@ -310,10 +325,9 @@ def log_info(
     print(
         f"Step: {('Prediction' if elapsed is not None else 'Selection'):<10} |",  # noqa: E501
         f"Action #: {num_actions:<2} |",
-        f"State 'Tip': {root.state[-1] if root else 'N/A':<6} |",
         f"Rollout #: {rollout_index if rollout_index is not None else 'N/A':<4} |",  # noqa: E501
         f"Action: {node.display_action if node else 'N/A':<6} |",
-        f"Token: {repr(token) if token is not None else 'N/A':<7} |",
+        f"Token: {repr(token) if token is not None else 'N/A':<8} |",
         f"Elapsed: {(str(np.round(elapsed, 3)) + 's' if elapsed is not None else 'N/A'):<7} |",  # noqa: E501
     )
 
@@ -327,14 +341,13 @@ class MCTS:
     debug: bool
 
     def __post_init__(self):
-        # Set seeds
-        np.random.seed(SEED)
-        torch.manual_seed(SEED)
-        torch.cuda.manual_seed_all(SEED)
         self.tokenizer = self.model_context.tokenizer
         self.ctx = self.model_context
 
-    def run(self, remote: bool = False):
+    def run(self):
+        # Warmup
+        self.ctx.generate([1, 2, 3])
+        # Run
         print("Running MCTS...")
         state = self.tokenizer.encode(self.problem.prompt)
         node = root = Node(
@@ -358,7 +371,7 @@ class MCTS:
                 while True:
                     if node.is_leaf_node:
                         if self.debug:
-                            log_info(num_actions, root, node, i, None, None)
+                            log_info(num_actions, node, i, None, None)
                         break
                     node = max(node.children, key=self.policy)
                 if not node.state[-1] == self.ctx.terminal_token_id:
@@ -366,7 +379,7 @@ class MCTS:
                     # NB: If scores are the same, first node will always be selected.  # noqa: E501
                     node = max(node.children, key=self.policy)
                     # Simulate (simulate rollout)
-                    output = self.ctx.generate(node.state, remote=remote)  # noqa: E501
+                    output = self.ctx.generate(node.state)  # noqa: E501
                     text = self.tokenizer.decode(output["sequence"])
                     code = extract_code(text)
                     # Compute reward
@@ -385,7 +398,6 @@ class MCTS:
             elapsed = time() - start
             log_info(
                 num_actions,
-                None,
                 node,
                 None,
                 self.tokenizer.decode(node.action),
@@ -405,7 +417,7 @@ class MCTS:
         )
 
 
-def parse_args():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--remote", action="store_true", default=False)
     parser.add_argument(
@@ -418,29 +430,18 @@ def parse_args():
     parser.add_argument(
         "--test_problem_index", type=str, default=TEST_PROBLEM_INDEX
     )  # noqa: E501
-    known_args, _ = parser.parse_known_args()
-    return known_args
-
-
-@stub.local_entrypoint()
-def main():
-    # Setup
-    args = parse_args()
-    problem = Problem(TEST_PROBLEMS_DIR, args.test_problem_index)
-    policy = Policy()
-    model_context = ModelContext(
-        MODEL_PATH,
-        MODEL_NAME,
-        k=args.K,
-        terminal_token=TERMINAL_TOKEN,
-        max_gen_horizon=MAX_GEN_HORIZON,
-    )  # noqa: E501
-    mcts = MCTS(
-        problem,
-        model_context,
-        policy,
-        args.num_rollouts,
-        args.debug,  # noqa: E501
-    )
-    # Run
-    mcts.run(remote=args.remote)
+    args = parser.parse_args()
+    with stub.run():
+        # Setup
+        problem = Problem(TEST_PROBLEMS_DIR, args.test_problem_index)
+        policy = Policy()
+        model_context = ModelContext(k=args.K, remote=args.remote)
+        mcts = MCTS(
+            problem,
+            model_context,
+            policy,
+            args.num_rollouts,
+            args.debug,
+        )
+        # Run
+        mcts.run()
