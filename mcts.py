@@ -5,15 +5,20 @@ import modal
 
 from const import TEST_PROBLEMS_DIR
 from type import ModelContext, Node, Policy, Problem
-from util import compute_reward, extract_code, log_info
+from util import compute_reward, extract_code, log_info, parse_args
 
 # Suppress noisy warnings from reward evaluation code
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+args = parse_args()
+
 # Modal config
 stub = modal.Stub(
-    "mcts-llm-codegen",
-    image=modal.Image.from_registry("nvcr.io/nvidia/pytorch:22.12-py3")
+    image=(
+        modal.Image.debian_slim()
+        if args.dry or args.no_cuda
+        else modal.Image.from_registry("nvcr.io/nvidia/pytorch:22.12-py3")
+    )
     .pip_install(
         "torch==2.0.1+cu118", index_url="https://download.pytorch.org/whl/cu118"
     )
@@ -29,7 +34,9 @@ stub = modal.Stub(
 
 
 @stub.cls(
-    # gpu="any",
+    gpu="any"
+    if args.remote and (not args.no_cuda) and (not args.dry)
+    else None,  # noqa: E501,
     secret=modal.Secret.from_dict(
         {"TOKENIZERS_PARALLELISM": os.environ["TOKENIZERS_PARALLELISM"]}
     ),
@@ -39,6 +46,8 @@ stub = modal.Stub(
             TEST_PROBLEMS_DIR, remote_path=f"/root/{TEST_PROBLEMS_DIR}"
         )
     ],
+    concurrency_limit=args.concurrency_limit,
+    timeout=60 * 60,
 )
 class MCTS:
     def __init__(
@@ -91,10 +100,10 @@ class MCTS:
         total_elapsed = 0
         rewards_cache = {}
         result = list(state)
-        while True:
+        while len(result) < self.ctx.max_gen_horizon:
             start = time()
             # Perform rollouts
-            for i in range(1, num_rollouts + 1):
+            for _ in range(1, num_rollouts + 1):
                 # Start at root
                 node = root
                 # Selection (select a leaf node)
@@ -111,10 +120,11 @@ class MCTS:
                     text = self.tokenizer.decode(output["sequence"])
                     code = extract_code(text)
                     # Compute reward
-                    key = (code, self.problem)
-                    if key not in rewards_cache:
-                        rewards_cache[key] = compute_reward(code, self.problem)
-                    reward = rewards_cache[key]
+                    if code not in rewards_cache:
+                        rewards_cache[code] = compute_reward(
+                            code, self.problem
+                        )  # noqa: E501
+                    reward = rewards_cache[code]
                     # Backpropagation (update node statistics)
                     while node:
                         node.visits += 1
@@ -138,12 +148,13 @@ class MCTS:
             # Check if we're done
             if node.state[-1] == self.ctx.terminal_token_id:
                 break
-        code = extract_code(self.tokenizer.decode(result))
-        reward = compute_reward(code, self.problem)
+        code = max(rewards_cache, key=rewards_cache.get)
+        reward = rewards_cache[code]
         return {
             "code": code,
             "reward": reward,
             "start_time": start_time,
             "elapsed_ms": total_elapsed,
             "generations": self.ctx.generations,
+            "num_programs_generated": len(rewards_cache),
         }
