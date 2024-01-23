@@ -1,11 +1,12 @@
 import os
 from time import time
+from typing import Dict
 
 import modal
 
 from const import TEST_PROBLEMS_DIR
 from type import ModelContext, Node, Policy, Problem
-from util import compute_reward, extract_code, log_info, parse_args
+from util import compute_reward, extract_code, log_info, parse_args, visualize_tree
 
 # Suppress noisy warnings from reward evaluation code
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -85,12 +86,11 @@ class MCTS:
                 "reward": 1,
                 "start_time": start_time,
                 "elapsed_ms": num_rollouts / 100,
-                "generations": 0,
             }
         state = self.tokenizer.encode(self.problem.prompt)
-        node = root = Node(
+        node = root = absolute_root = Node(
             state=state,
-            action=None,
+            action="root",
             prob=None,
             parent=None,
             model_context=self.ctx,
@@ -109,27 +109,28 @@ class MCTS:
                 # Selection (select a leaf node)
                 while True:
                     if node.is_leaf_node:
+                        node.selected += 1
                         break
                     node = max(node.children, key=self.policy)
-                if not node.state[-1] == self.ctx.terminal_token_id:
-                    # Expansion (expand children, select one to rollout)
-                    # NB: If scores are the same, first node will always be selected.  # noqa: E501
+                # Expansion (expand children, select one to rollout)
+                if node.action != self.ctx.terminal_token_id:
+                    # NB: If scores are the same, first child will always be selected.  # noqa: E501
                     node = max(node.children, key=self.policy)
-                    # Simulate (simulate rollout)
-                    output = self.ctx.generate(node.state)  # noqa: E501
-                    text = self.tokenizer.decode(output["sequence"])
-                    code = extract_code(text)
-                    # Compute reward
-                    if code not in rewards_cache:
-                        rewards_cache[code] = compute_reward(
-                            code, self.problem
-                        )  # noqa: E501
-                    reward = rewards_cache[code]
-                    # Backpropagation (update node statistics)
-                    while node:
-                        node.visits += 1
-                        node.observed_rewards.append(reward)
-                        node = node.parent
+                # Simulate (simulate rollout)
+                output = self.ctx.generate(node.state)  # noqa: E501
+                text = self.tokenizer.decode(output["sequence"])
+                code = extract_code(text)
+                # Compute reward
+                if code not in rewards_cache:
+                    rewards_cache[code] = compute_reward(
+                        code, self.problem
+                    )  # noqa: E501
+                reward = rewards_cache[code]
+                # Backpropagation (update node statistics)
+                while node:
+                    node.visits += 1
+                    node.observed_rewards.append(reward)
+                    node = node.parent
             # Take action, reset root
             node = root = max(root.children, key=lambda node: node.value)
             # Log action
@@ -138,7 +139,6 @@ class MCTS:
                 log_info(
                     num_actions,
                     node,
-                    None,
                     self.tokenizer.decode(node.action),
                     elapsed,
                 )
@@ -146,15 +146,18 @@ class MCTS:
             num_actions += 1
             total_elapsed += elapsed
             # Check if we're done
-            if node.state[-1] == self.ctx.terminal_token_id:
+            if node.action == self.ctx.terminal_token_id:
                 break
         code = max(rewards_cache, key=rewards_cache.get)
         reward = rewards_cache[code]
+        if self.debug:
+            visualize_tree(absolute_root, self.ctx.tokenizer)
         return {
             "code": code,
             "reward": reward,
             "start_time": start_time,
             "elapsed_ms": total_elapsed,
-            "generations": self.ctx.generations,
-            "num_programs_generated": len(rewards_cache),
+            "num_sequence_generations": self.ctx.num_sequence_gens,
+            "num_next_token_generations": self.ctx.num_next_token_gens,
+            "num_unique_program_generations": len(rewards_cache),
         }
