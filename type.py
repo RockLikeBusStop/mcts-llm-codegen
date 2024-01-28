@@ -1,5 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
+import os
+from time import time
 from typing import List, Optional, Union
 
 import numpy as np
@@ -7,22 +9,24 @@ import torch
 import transformers
 
 from const import (
+    APPS_PROBLEMS_DIR,
     MAX_GEN_HORIZON,
     MODEL_NAME,
-    MODEL_PATH,
     NO_CUDA,
     NUM_BEAMS,
     SEED,
     TERMINAL_TOKEN,
     UCB_BASE,
     UCB_CONSTANT,
-    K,
 )
 
 
-class Problem:
-    def __init__(self, base_path: str, idx: int):
-        self.dir = f"{base_path}/{idx}"
+class APPSProblem:
+    base_path = APPS_PROBLEMS_DIR
+    problem_indices = os.listdir(base_path)
+
+    def __init__(self, idx: str):
+        self.dir = f"{self.base_path}/{idx}"
         self.input_output_path = f"{self.dir}/input_output.json"
         self.question_path = f"{self.dir}/question.txt"
         self.solutions_path = f"{self.dir}/solutions.json"
@@ -36,7 +40,7 @@ class Problem:
 
     def _generate_prompt(self):
         prompt = "\nQUESTION:\n"
-        with open(self.question_path, "r") as f:
+        with open(self.question_path, "r", encoding="utf-8") as f:
             data = f.readlines()
             data = "".join(data)
             prompt += data
@@ -92,7 +96,7 @@ class OutputTrie:
 class ModelContext:
     def __init__(
         self,
-        model_path: str = MODEL_PATH,
+        model_path: str,
         model_name: str = MODEL_NAME,
         terminal_token: str = TERMINAL_TOKEN,
         max_gen_horizon: int = MAX_GEN_HORIZON,
@@ -107,9 +111,6 @@ class ModelContext:
         self.num_beams = num_beams
 
     def initialize(self):
-        # Initialize
-        self.num_sequence_gens = 0
-        self.num_next_token_gens = 0
         # Load tokenizer
         tokenizer = transformers.AutoTokenizer.from_pretrained(self.model_name)
         (self.terminal_token_id,) = tokenizer.encode(self.terminal_token)
@@ -132,13 +133,14 @@ class ModelContext:
         )
         self.model.to(self.device)
 
-    def _generate(self, ids: List[int], next_token_only: bool = False):
+    def _generate(self, ids: List[int], stats: dict, next_token_only: bool = False):
         input_ids = torch.LongTensor(ids).unsqueeze(0).to(self.device)
         kwargs = (
             {"max_new_tokens": 1}
             if next_token_only
             else {"max_length": self.max_gen_horizon}
         )
+        start = time()
         output = self.model.generate(
             input_ids,
             num_beams=self.num_beams,
@@ -149,11 +151,12 @@ class ModelContext:
             do_sample=False,
             **kwargs,
         )
-        # Update counters
+        # Update stats
         if next_token_only:
-            self.num_next_token_gens += 1
+            stats["num_next_token_gens"] += 1
         else:
-            self.num_sequence_gens += 1
+            stats["num_sequence_gens"] += 1
+        stats["generation_times"].append(time() - start)
         # Extract output
         (sequence,) = output.sequences
         sequence = sequence.squeeze(0).tolist()
@@ -163,12 +166,13 @@ class ModelContext:
     def generate(
         self,
         ids: List[int],
+        stats: dict,
         next_token_only: bool = False,
     ):
         output = self.cache.search(ids, next_token_only)
         if output:
             return output
-        output = self._generate(ids, next_token_only)
+        output = self._generate(ids, stats, next_token_only)
         self.cache.insert(
             output["sequence"],
             output["scores"],
@@ -185,6 +189,7 @@ class Node:
         parent: Optional["Node"],
         model_context: ModelContext,  # type: ignore
         k: int,
+        stats: dict,
     ) -> None:
         self.state = state
         self.action = action
@@ -192,6 +197,7 @@ class Node:
         self.parent = parent
         self.ctx = model_context
         self.k = k
+        self.stats = stats
         self.visits = 0
         self.selected = 0
         self.observed_rewards = []
@@ -225,7 +231,7 @@ class Node:
         return max(self.observed_rewards)
 
     def _generate_children(self):
-        output = self.ctx.generate(self.state, next_token_only=True)
+        output = self.ctx.generate(self.state, self.stats, next_token_only=True)
         (scores,) = output["scores"]
         top_k_scores, top_k_ids = torch.topk(scores, self.k)
         top_k_scores = torch.softmax(top_k_scores, dim=-1)
@@ -242,6 +248,7 @@ class Node:
                     parent=self,
                     model_context=self.ctx,
                     k=self.k,
+                    stats=self.stats,
                 )
             )
         return children
@@ -259,15 +266,10 @@ class Policy:
         """
         if not node.parent:
             raise Exception("Node has no parent; cannot compute UCB.")
-        param = (
-            np.log((node.parent.visits + self.base + 1) / self.base)
-            + self.constant  # noqa: E501
-        )
+        param = np.log((node.parent.visits + self.base + 1) / self.base) + self.constant
         return node.value + param * node.prob * np.sqrt(
             np.log(node.parent.visits) if node.parent.visits >= 1 else 0
-        ) / (  # noqa: E501
-            1 + len(node.observed_rewards)
-        )
+        ) / (1 + len(node.observed_rewards))
 
     def __call__(self, node: Node) -> float:
         return self.compute_upper_confidence_bound(node)

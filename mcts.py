@@ -1,50 +1,28 @@
 import os
 from time import time
-from typing import Dict
 
 import modal
+from const import MODEL_PATH
 
-from const import TEST_PROBLEMS_DIR
-from type import ModelContext, Node, Policy, Problem
+from stub import stub
+from type import ModelContext, Node, Policy, APPSProblem
 from util import compute_reward, extract_code, log_info, parse_args, visualize_tree
 
 # Suppress noisy warnings from reward evaluation code
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
 args = parse_args()
-
-# Modal config
-stub = modal.Stub(
-    image=(
-        modal.Image.debian_slim()
-        if args.dry or args.no_cuda
-        else modal.Image.from_registry("nvcr.io/nvidia/pytorch:22.12-py3")
-    )
-    .pip_install(
-        "torch==2.0.1+cu118", index_url="https://download.pytorch.org/whl/cu118"
-    )
-    .pip_install("transformers", "gdown", "pyext")
-    .run_commands(
-        # Download 1.5B param model
-        "gdown 1svUcwtqL6AD_Ti0eXJS03AaMdS7HDZ0d -O /root/",
-        # Extract model
-        "mkdir -p /root/models",
-        "tar -xvf /root/models_1.5B.tar -C /root/models",
-    ),
-)
 
 
 @stub.cls(
-    gpu="any"
-    if args.remote and (not args.no_cuda) and (not args.dry)
-    else None,  # noqa: E501,
+    gpu="any" if args.remote and (not args.no_cuda) and (not args.dry) else None,
+    cloud="aws",
     secret=modal.Secret.from_dict(
         {"TOKENIZERS_PARALLELISM": os.environ["TOKENIZERS_PARALLELISM"]}
     ),
     container_idle_timeout=60 * 2,
     mounts=[
         modal.Mount.from_local_dir(
-            TEST_PROBLEMS_DIR, remote_path=f"/root/{TEST_PROBLEMS_DIR}"
+            APPSProblem.base_path, remote_path=f"/root/{APPSProblem.base_path}"
         )
     ],
     concurrency_limit=args.concurrency_limit,
@@ -53,23 +31,25 @@ stub = modal.Stub(
 class MCTS:
     def __init__(
         self,
-        test_problem_index: int,
         debug: bool,
         dry: bool,
+        visualize: bool = False,
+        model_path: str = MODEL_PATH,
     ):
-        self.problem = Problem(TEST_PROBLEMS_DIR, test_problem_index)
-        self.policy = Policy()
         self.debug = debug
         self.dry = dry
+        self.visualize = visualize
+        self.model_path = model_path
 
     def __enter__(self):
         if not self.dry:
-            self.ctx = ModelContext()
+            self.policy = Policy()
+            self.ctx = ModelContext(self.model_path)
             self.ctx.initialize()
             self.tokenizer = self.ctx.tokenizer
 
     @modal.method()
-    def run(self, k: int, num_rollouts: int):
+    def run(self, k: int, num_rollouts: int, problem_index: str, **kwargs):
         """
         Run MCTS on the given problem.
 
@@ -79,15 +59,33 @@ class MCTS:
         Returns:
             (code, reward): Generated code and reward.
         """
+        # Initialize
+        config = {k: v for k, v in locals().copy().items()}
+        config = {**config, **kwargs}
+        config = {k: v for k, v in config.items() if k not in ["self", "kwargs"]}
         start_time = time()
         if self.dry:
             return {
-                "code": "dummy code",
-                "reward": 1,
-                "start_time": start_time,
-                "elapsed_ms": num_rollouts / 100,
+                "config": config,
+                "result": {
+                    "code": "dummy code",
+                    "train_reward": 1,
+                    "start_time": start_time,
+                },
             }
-        state = self.tokenizer.encode(self.problem.prompt)
+        # Run MCTS
+        problem = APPSProblem(problem_index)
+        state = self.tokenizer.encode(problem.prompt)
+        stats = {
+            "num_sequence_gens": 0,
+            "num_next_token_gens": 0,
+            "generation_times": [],
+        }
+        num_actions = 0
+        total_elapsed = 0
+        rewards_cache = {}
+        result = list(state)
+        # Define root node
         node = root = absolute_root = Node(
             state=state,
             action="root",
@@ -95,11 +93,8 @@ class MCTS:
             parent=None,
             model_context=self.ctx,
             k=k,
+            stats=stats,
         )
-        num_actions = 0
-        total_elapsed = 0
-        rewards_cache = {}
-        result = list(state)
         while len(result) < self.ctx.max_gen_horizon:
             start = time()
             # Perform rollouts
@@ -114,17 +109,15 @@ class MCTS:
                     node = max(node.children, key=self.policy)
                 # Expansion (expand children, select one to rollout)
                 if node.action != self.ctx.terminal_token_id:
-                    # NB: If scores are the same, first child will always be selected.  # noqa: E501
+                    # NB: If scores are the same, first child will always be selected.
                     node = max(node.children, key=self.policy)
                 # Simulate (simulate rollout)
-                output = self.ctx.generate(node.state)  # noqa: E501
+                output = self.ctx.generate(node.state, stats)
                 text = self.tokenizer.decode(output["sequence"])
                 code = extract_code(text)
                 # Compute reward
                 if code not in rewards_cache:
-                    rewards_cache[code] = compute_reward(
-                        code, self.problem
-                    )  # noqa: E501
+                    rewards_cache[code] = compute_reward(code, problem)
                 reward = rewards_cache[code]
                 # Backpropagation (update node statistics)
                 while node:
@@ -148,16 +141,23 @@ class MCTS:
             # Check if we're done
             if node.action == self.ctx.terminal_token_id:
                 break
-        code = max(rewards_cache, key=rewards_cache.get)
+        code = max(rewards_cache, key=rewards_cache.get)  # type: ignore
         reward = rewards_cache[code]
-        if self.debug:
+        if self.visualize:
             visualize_tree(absolute_root, self.ctx.tokenizer)
         return {
-            "code": code,
-            "reward": reward,
-            "start_time": start_time,
-            "elapsed_ms": total_elapsed,
-            "num_sequence_generations": self.ctx.num_sequence_gens,
-            "num_next_token_generations": self.ctx.num_next_token_gens,
-            "num_unique_program_generations": len(rewards_cache),
+            "config": config,
+            "result": {
+                "code": code,
+                "train_reward": reward,
+                "train_reward_from_selected_nodes_program": compute_reward(
+                    extract_code(self.tokenizer.decode(result)), problem
+                ),
+                "start_time": start_time,
+                "elapsed_ms": total_elapsed,
+                "generation_elapsed_ms": sum(stats["generation_times"]),
+                "num_sequence_generations": stats["num_sequence_gens"],
+                "num_next_token_generations": stats["num_next_token_gens"],
+                "num_unique_program_generations": len(rewards_cache),
+            },
         }
