@@ -11,6 +11,7 @@ import wandb
 from type import APPSProblem, Node
 from const import (
     CONCURRENCY_LIMIT,
+    DEFAULT_WANDB_PROJECT_NAME,
     K,
     NO_CUDA,
     NUM_ROLLOUTS,
@@ -61,7 +62,7 @@ def parse_args():
     parser.add_argument("--K", type=int, help="Number of expanded children", default=K)
     parser.add_argument("--num_rollouts", type=int, default=NUM_ROLLOUTS)
     parser.add_argument("--concurrency_limit", type=int, default=CONCURRENCY_LIMIT)
-    parser.add_argument("--experiment_name", type=str)
+    parser.add_argument("--experiment_name", type=str, default=None)
     parser.add_argument(
         "--problem_index",
         type=str,
@@ -99,12 +100,18 @@ def visualize_tree(root, tokenizer):
     graph.render("tree", format="png")
 
 
-def compose_configs(experiment_name, dry, project_name="mcts-llm-codegen"):
-    runs = wandb.Api().runs(project_name, filters={"group": experiment_name})
+def get_wandb_runs(experiment_name, project_name=DEFAULT_WANDB_PROJECT_NAME):
+    return wandb.Api().runs(project_name, filters={"group": experiment_name})
+
+
+def compose_configs(
+    problem_indices, experiment_name, dry, project_name=DEFAULT_WANDB_PROJECT_NAME
+):
+    runs = get_wandb_runs(experiment_name, project_name)
     already_run = [run.config for run in runs]
     exp = experiments[experiment_name]
     configs = []
-    for idx in APPSProblem.problem_indices:
+    for idx in problem_indices:
         for cfg in list(itertools.product(*exp.values())):
             cfg = {
                 **dict(zip(exp.keys(), cfg)),
