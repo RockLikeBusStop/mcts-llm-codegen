@@ -8,9 +8,8 @@ import numpy as np
 import torch
 import transformers
 
-from const import (
+from app.const import (
     APPS_PROBLEMS_DIR,
-    DEFAULT_WANDB_PROJECT_NAME,
     MAX_GEN_HORIZON,
     MODEL_NAME,
     NO_CUDA,

@@ -3,11 +3,11 @@ from time import time
 
 import modal
 import wandb
-from const import DEFAULT_WANDB_PROJECT_NAME, MODEL_BASE_PATH
+from app.const import DEFAULT_WANDB_PROJECT_NAME, MODEL_BASE_PATH
 
-from stub import stub
-from type import ModelContext, Node, Policy, APPSProblem
-from util import compute_reward, extract_code, log_info, parse_args, visualize_tree
+from app.stub import stub
+from app.type import ModelContext, Node, Policy, APPSProblem
+from app.util import compute_reward, extract_code, log_info, parse_args, visualize_tree
 
 # Suppress noisy warnings from reward evaluation code
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -27,7 +27,10 @@ args = parse_args()
     mounts=[
         modal.Mount.from_local_dir(
             APPSProblem.base_path, remote_path=f"/root/{APPSProblem.base_path}"
-        )
+        ),
+        modal.Mount.from_local_dir(
+            "Code-AI-Tree-Search/eval", remote_path="/root/Code-AI-Tree-Search/eval"
+        ),
     ],
     concurrency_limit=args.concurrency_limit,
     timeout=60 * 180,
@@ -64,7 +67,7 @@ class MCTS:
 
     @property
     def log_results(self):
-        return self.experiment_name is not None
+        return self.experiment_name is not None and not args.dry
 
     def log_results_to_wandb(self, result: dict, config: dict):
         code, problem_index = result["code"], config["problem_index"]
